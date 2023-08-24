@@ -31,6 +31,8 @@ from ._manipulate import checkpoint_seq, named_apply
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
 from .vision_transformer import get_init_weights_vit
 
+from pytorch_quantization import nn as quant_nn
+
 __all__ = ['SwinTransformer']  # model_registry will add each entrypoint fn to this
 
 _logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ class WindowAttention(nn.Module):
             qkv_bias: bool = True,
             attn_drop: float = 0.,
             proj_drop: float = 0.,
+            quantize: bool = False
     ):
         """
         Args:
@@ -108,6 +111,7 @@ class WindowAttention(nn.Module):
             qkv_bias:  If True, add a learnable bias to query, key, value.
             attn_drop: Dropout ratio of attention weight.
             proj_drop: Dropout ratio of output.
+            quantize: If True, quantize additional layers in the model.
         """
         super().__init__()
         self.dim = dim
@@ -134,6 +138,13 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
+        self.quantize = quantize
+        if self.quantize:
+            self.q_quant = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+            self.k_quant = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+            self.v_quant = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+            self.attn_quant = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+
     def _get_rel_pos_bias(self) -> torch.Tensor:
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)].view(self.window_area, self.window_area, -1)  # Wh*Ww,Wh*Ww,nH
@@ -156,6 +167,10 @@ class WindowAttention(nn.Module):
                 num_win = mask.shape[0]
                 mask = mask.view(1, num_win, 1, N, N).expand(B_ // num_win, -1, self.num_heads, -1, -1)
                 attn_mask = attn_mask + mask.reshape(-1, self.num_heads, N, N)
+            if self.quantize:
+                q = self.q_quant(q)
+                k = self.k_quant(k)
+                v = self.v_quant(v)
             x = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
@@ -163,7 +178,12 @@ class WindowAttention(nn.Module):
             )
         else:
             q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
+            k_transpose = k.transpose(-2, -1)
+            if self.quantize:
+                q = self.q_quant(q)
+                k_transpose = self.k_quant(k_transpose)
+                v = self.v_quant(v)
+            attn = q @ k_transpose
             attn = attn + self._get_rel_pos_bias()
             if mask is not None:
                 num_win = mask.shape[0]
@@ -171,6 +191,8 @@ class WindowAttention(nn.Module):
                 attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
             attn = self.attn_drop(attn)
+            if self.quantize:
+                attn = self.attn_quant(attn)
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B_, N, -1)
@@ -198,6 +220,7 @@ class SwinTransformerBlock(nn.Module):
             drop_path: float = 0.,
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = nn.LayerNorm,
+            quantize: bool = False
     ):
         """
         Args:
@@ -214,6 +237,7 @@ class SwinTransformerBlock(nn.Module):
             drop_path: Stochastic depth rate.
             act_layer: Activation layer.
             norm_layer: Normalization layer.
+            quantize: If True, quantize additional layers in the model.
         """
         super().__init__()
         self.dim = dim
@@ -227,6 +251,11 @@ class SwinTransformerBlock(nn.Module):
             self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
+        self.quantize = quantize
+        if self.quantize:
+            self.quant_1 = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+            self.quant_2 = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim,
@@ -236,6 +265,7 @@ class SwinTransformerBlock(nn.Module):
             qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
+            quantize=self.quantize
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -302,10 +332,16 @@ class SwinTransformerBlock(nn.Module):
             x = shifted_x
 
         # FFN
-        x = shortcut + self.drop_path(x)
+        if self.quantize:
+            x = shortcut + self.quant_1(self.drop_path(x))
+        else:
+            x = shortcut + self.drop_path(x)
 
         x = x.reshape(B, -1, C)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if self.quantize:
+            x = x + self.quant_2(self.drop_path(self.mlp(self.norm2(x))))
+        else:
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
         x = x.reshape(B, H, W, C)
         return x
 
@@ -362,6 +398,7 @@ class SwinTransformerStage(nn.Module):
             attn_drop: float = 0.,
             drop_path: Union[List[float], float] = 0.,
             norm_layer: Callable = nn.LayerNorm,
+            quantize: bool = False
     ):
         """
         Args:
@@ -378,6 +415,7 @@ class SwinTransformerStage(nn.Module):
             attn_drop: Attention dropout rate.
             drop_path: Stochastic depth rate.
             norm_layer: Normalization layer.
+            quantize: It True, quantize additional layers in the model.
         """
         super().__init__()
         self.dim = dim
@@ -385,6 +423,7 @@ class SwinTransformerStage(nn.Module):
         self.output_resolution = tuple(i // 2 for i in input_resolution) if downsample else input_resolution
         self.depth = depth
         self.grad_checkpointing = False
+        self.quantize = quantize
 
         # patch merging layer
         if downsample:
@@ -412,6 +451,7 @@ class SwinTransformerStage(nn.Module):
                 attn_drop=attn_drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
+                quantize=self.quantize
             )
             for i in range(depth)])
 
@@ -474,6 +514,7 @@ class SwinTransformer(nn.Module):
         """
         super().__init__()
         assert global_pool in ('', 'avg')
+        self.quantize = kwargs["quantize"]
         self.num_classes = num_classes
         self.global_pool = global_pool
         self.output_fmt = 'NHWC'
@@ -525,6 +566,7 @@ class SwinTransformer(nn.Module):
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
+                quantize=self.quantize
             )]
             in_dim = out_dim
             if i > 0:
